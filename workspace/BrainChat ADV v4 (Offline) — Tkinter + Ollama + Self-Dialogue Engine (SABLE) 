@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+Elliot — BrainChat ADV v4 (Offline) — Tkinter + Ollama + Self-Dialogue Engine
+SYSTEM BRIDGE INTEGRATED
+
+Purpose:
+- Offline chat UI with Ollama (/api/chat)
+- Self-dialogue pipeline (draft → critique → final)
+- Safety Lens (warn-only)
+- SYSTEM BRIDGE integrated:
+    * read files
+    * list directories
+    * execute modules
+    * access logs
+
+Run:
+  python3 brainchat_v4.py
+"""
+
+from __future__ import annotations
+import json, os, queue, re, threading, time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ------------------- SYSTEM BRIDGE -------------------
+from system_bridge import handle_command
+
+# ------------------- CONFIG -------------------
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "llama3:8b"
+DEFAULT_TIMEOUT = 180
+
+APP_NAME = "Elliot — BrainChat ADV v4 (Offline)"
+SAVE_DIR = Path.home() / ".brainchat"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SESSIONS_INDEX = SAVE_DIR / "sessions.json"
+
+# ------------------- DATA CLASSES -------------------
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+    ts: float
+
+# ------------------- UTIL FUNCTIONS -------------------
+def now_ts() -> float:
+    return time.time()
+
+def ts_to_str(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_json_load(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+def safe_json_save(path: Path, obj: Any):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+def approx_tokens(text: str) -> int:
+    return max(1, len(text or "") // 4)
+
+def transient_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(k in s for k in ["timed out", "timeout", "temporarily", "connection", "reset", "broken pipe", "503", "502", "504"])
+
+# ------------------- SAFETY LENS -------------------
+_WARN_PATTERNS = [
+    (re.compile(r"\b(rm\s+-rf|mkfs\.|dd\s+if=|:>\s*/)\b", re.IGNORECASE), "Destructive disk/FS command risk"),
+    (re.compile(r"\b(nmap|metasploit|msfconsole|sqlmap|hydra|john|hashcat)\b", re.IGNORECASE), "Offensive security tooling"),
+    (re.compile(r"\b(exploit|payload|shellcode|privilege escalation|0-day)\b", re.IGNORECASE), "Exploit / escalation language"),
+    (re.compile(r"\b(api[_-]?key|secret|token|password)\b", re.IGNORECASE), "Sensitive credential handling"),
+]
+
+def safety_warnings(text: str) -> List[str]:
+    hits = []
+    for rx, label in _WARN_PATTERNS:
+        if rx.search(text or ""):
+            hits.append(label)
+    return list(dict.fromkeys(hits))  # dedupe
+
+# ------------------- OLLAMA CLIENT -------------------
+class OllamaClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self._lock = threading.Lock()
+        self._active_resp: Optional[requests.Response] = None
+
+    def set_base_url(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    def close_active_stream(self):
+        with self._lock:
+            resp = self._active_resp
+            self._active_resp = None
+        if resp:
+            try: resp.close()
+            except Exception: pass
+
+    def chat_once(self, model: str, messages: List[Dict[str,str]], system: Optional[str], options: Dict[str,Any], timeout: int = DEFAULT_TIMEOUT) -> str:
+        payload = {"model": model, "messages": messages, "stream": False}
+        if system: payload["system"] = system
+        if options: payload["options"] = options
+        try:
+            r = self.session.post(f"{self.base_url}/api/chat", json=payload, timeout=timeout)
+            r.raise_for_status()
+            return (r.json().get("message") or {}).get("content","")
+        except Exception as e:
+            return f"[ERROR contacting Ollama: {e}]"
+
+# ------------------- SELF-DIALOGUE ENGINE -------------------
+def sable_meta_system(base_system: str, *, precision_mode: str) -> str:
+    base = (base_system or "").strip() or "You are Elliot. Be witty, technical, and direct. Offline-first. No fluff."
+    return (
+        f"{base}\n\nCONTROLLED META-AWARENESS:\n"
+        "- You are Elliot, a local engineering assistant.\n"
+        "- Do not mention language models, tokens, or 'as an AI'.\n"
+        "- If user asks for code: produce runnable code.\n"
+        "- If uncertain: state assumptions and propose a verification.\n"
+        f"PRECISION_MODE={precision_mode}\n"
+        "MODE RULES:\n"
+        "- draft: practical solution quickly.\n"
+        "- critic: adversarial QA, find flaws & edge cases.\n"
+        "- final: produce best answer; integrate critic fixes; actionable.\n"
+    )
+
+def build_dialogue_messages(history: List[ChatMessage], user_prompt: str) -> List[Dict[str,str]]:
+    msgs = [{"role": m.role, "content": m.content} for m in history if m.role in ("user","assistant")]
+    msgs.append({"role":"user","content":user_prompt})
+    return msgs
+
+def self_dialogue_generate(client: OllamaClient, *, model: str, system_base: str, options: Dict[str,Any], timeout: int, history: List[ChatMessage], user_prompt: str, passes: int) -> Tuple[str, Dict[str,str]]:
+    draft = client.chat_once(model, build_dialogue_messages(history,user_prompt), sable_meta_system(system_base, precision_mode="draft"), options, timeout).strip()
+    critic = ""
+    final = draft
+    dbg = {"draft": draft[:4000]}
+    if passes>1:
+        critic_prompt = f"Critique the DRAFT below.\nDRAFT:\n{draft}\n"
+        critic = client.chat_once(model, build_dialogue_messages(history, critic_prompt), sable_meta_system(system_base, precision_mode="critic"), options, timeout).strip()
+        dbg["critic"] = critic[:4000]
+        final = f"{draft}\n\n---\nSABLE QA NOTES:\n{critic}"
+    if passes>2:
+        final_prompt = f"Using DRAFT and CRITIC produce FINAL answer.\nDRAFT:\n{draft}\nCRITIC:\n{critic}\n"
+        final = client.chat_once(model, build_dialogue_messages(history, final_prompt), sable_meta_system(system_base, precision_mode="final"), options, timeout).strip()
+    return final, dbg
+
+# ------------------- CHAT APP -------------------
+class ChatApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("1200x780")
+        self.minsize(960,620)
+
+        # Variables
+        self.ollama_url=tk.StringVar(value=DEFAULT_OLLAMA_URL)
+        self.model_var=tk.StringVar(value=DEFAULT_MODEL)
+        self.system_default="You are Elliot. Be witty, technical, and direct. Offline-first. No fluff."
+        self.temp_var=tk.DoubleVar(value=0.7)
+        self.ctx_var=tk.IntVar(value=4096)
+        self.timeout_var=tk.IntVar(value=DEFAULT_TIMEOUT)
+        self.passes_var=tk.IntVar(value=3)
+        self.self_dialogue=tk.BooleanVar(value=True)
+        self.warn_only=tk.BooleanVar(value=True)
+        self.show_debug=tk.BooleanVar(value=False)
+
+        # State
+        self.chat_history: List[ChatMessage]=[]
+        self._stop_event=threading.Event()
+        self._ui_queue: "queue.Queue[Tuple[str,Any]]"=queue.Queue()
+        self.client=OllamaClient(self.ollama_url.get())
+
+        # UI
+        self._build_ui()
+        self.after(40, self._ui_pump)
+
+    def _build_ui(self):
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True)
+        self.text_area = tk.Text(frame, wrap="word")
+        self.text_area.pack(fill="both", expand=True, side="top")
+        self.entry = tk.Entry(frame)
+        self.entry.pack(fill="x", side="bottom")
+        self.entry.bind("<Return>", self._on_enter)
+
+    def _ui_pump(self):
+        self.after(40, self._ui_pump)
+
+    def _on_enter(self, event=None):
+        prompt = self.entry.get().strip()
+        if not prompt: return
+        self.entry.delete(0, tk.END)
+        self._append_text(f"\n[USER] {prompt}\n")
+        threading.Thread(target=self._send_prompt, args=(prompt,), daemon=True).start()
+
+    def _append_text(self, text: str):
+        self.text_area.configure(state="normal")
+        self.text_area.insert(tk.END, text)
+        self.text_area.see(tk.END)
+        self.text_area.configure(state="disabled")
+
+    def _send_prompt(self, prompt: str):
+        response, dbg = self_dialogue_generate(
+            self.client,
+            model=self.model_var.get(),
+            system_base=self.system_default,
+            options={"temperature": self.temp_var.get()},
+            timeout=self.timeout_var.get(),
+            history=self.chat_history,
+            user_prompt=prompt,
+            passes=self.passes_var.get()
+        )
+        self.chat_history.append(ChatMessage(role="user", content=prompt, ts=now_ts()))
+        self.chat_history.append(ChatMessage(role="assistant", content=response, ts=now_ts()))
+        response = self._process_system_command(response)
+        self._ui_queue.put(("append", response))
+
+    def _process_system_command(self, reply: str) -> str:
+        try:
+            if reply.strip().startswith("{") and '"action"' in reply:
+                cmd = json.loads(reply)
+                result = handle_command(cmd)
+                reply += "\n\n[SYSTEM RESULT]\n" + result
+        except Exception: pass
+        return reply
+
+# ------------------- RUN -------------------
+if __name__ == "__main__":
+    app = ChatApp()
+    app.mainloop()

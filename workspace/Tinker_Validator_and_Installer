@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+Tinker Validator and Installer
+Checks if Tinker is available, installs it if missing, and verifies installation.
+"""
+
+import sys
+import subprocess
+from pathlib import Path
+
+# -----------------------------
+# Add project root to sys.path
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# -----------------------------
+# Now imports work reliably
+# -----------------------------
+from core.utils import setup_logger
+
+# Logger
+logger = setup_logger("tinker_check", "tinker_check.log")
+
+def is_tinker_installed() -> bool:
+    """
+    Checks if 'tinker' is accessible in PATH.
+    """
+    try:
+        result = subprocess.run(["tinker", "--version"], capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"Tinker detected: {result.stdout.strip()}")
+            return True
+    except FileNotFoundError:
+        pass
+    logger.warning("Tinker not found.")
+    return False
+
+def install_tinker():
+    """
+    Installs Tinker using preferred method (pip in this example).
+    Adjust as necessary for your system/environment.
+    """
+    logger.info("Installing Tinker...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "tinker"], check=True)
+        logger.info("Tinker installation completed.")
+    except subprocess.CalledProcessError as e:
+        logger.critical(f"Tinker installation failed: {e}")
+        sys.exit(1)
+
+def main():
+    if not is_tinker_installed():
+        install_tinker()
+
+    # Verify post-install
+    if not is_tinker_installed():
+        logger.critical("Tinker still not found after installation attempt.")
+        sys.exit(1)
+    logger.info("Tinker is ready for use.")
+    print("Tinker is installed and ready.")
+
+if __name__ == "__main__":
+    main()
